@@ -1,0 +1,4 @@
+# MFT Reader - Forensic $MFT analysis GUI
+# Python 3.10+
+
+PySide6>=6.6.0

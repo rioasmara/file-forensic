@@ -1,0 +1,701 @@
+================================================================================
+CALCULATING ABNORMAL FILE ACTIVITY SEQUENCES
+Processing Specification for AI Agent Development
+Artifacts: $MFT (Master File Table) + $UsnJrnl:$J (Change Journal) only
+================================================================================
+
+
+================================================================================
+1. CONCEPT & CORE PRINCIPLE
+================================================================================
+
+The detection engine identifies ordered sequences of filesystem events that
+deviate from normal behavior patterns. Since only MFT and Journal data is
+available, there is no process context — no PIDs, no command lines, no
+parent-child process relationships. All detection is based purely on what
+happened to files on disk: when they were created, written, renamed,
+overwritten, and deleted.
+
+A sequence is a meaningful, ordered set of filesystem events on one or more
+files within a time or USN window that matches a known malicious behavioral
+signature.
+
+NOTE: Always sort events by USN (Update Sequence Number) as the primary key,
+not timestamp. Timestamps can be modified by an attacker. USN is a
+kernel-managed monotonic counter that cannot be altered from userspace and is
+therefore the most trustworthy ordering signal available.
+
+
+================================================================================
+2. BASELINE: WHAT NORMAL FILESYSTEM BEHAVIOR LOOKS LIKE
+================================================================================
+
+Before detecting abnormal, the engine must understand the normal baseline.
+From MFT and Journal data alone, normal behavior has the following
+characteristics:
+
+- File creations are distributed across time — not clustered in tight bursts
+- Executables are created in expected system paths: System32, Program Files,
+  WindowsApps
+- Files are long-lived — created and persisting for days, weeks, or months
+- Rename operations are rare and purposeful
+- Deletions happen gradually over time, not in rapid succession after a
+  creation burst
+- Directory structures are stable and grow slowly
+- MFT record allocation is spread across the day, not concentrated in short
+  windows
+
+The scoring model measures deviation from these baselines. The more signals
+deviate from expected patterns simultaneously, the higher the suspicion score.
+
+
+================================================================================
+3. REQUIRED DATA STRUCTURES
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1 EventType Enum
+--------------------------------------------------------------------------------
+
+All journal reason flags must be normalized into a single EventType enum
+before processing:
+
+- CREATE    -> mapped from FILE_CREATE reason flag
+- WRITE     -> mapped from DATA_EXTEND reason flag
+- OVERWRITE -> mapped from DATA_OVERWRITE reason flag
+- RENAME    -> mapped from RENAME_OLD_NAME or RENAME_NEW_NAME reason flags
+- DELETE    -> mapped from FILE_DELETE reason flag
+- METADATA  -> mapped from BASIC_INFO_CHANGE reason flag
+- DIRECTORY -> mapped from FILE_CREATE where the target is a directory
+
+--------------------------------------------------------------------------------
+3.2 NormalizedEvent (Primary Processing Object)
+--------------------------------------------------------------------------------
+
+This is the core data structure. It is created by joining each JournalEvent
+with its corresponding MFT record using file_ref as the join key. All
+detection engines operate on this object.
+
+Fields from Journal ($UsnJrnl):
+  - usn: int
+      Primary sort key, manipulation-resistant
+  - timestamp: datetime
+      Secondary sort key, may be manipulated
+  - file_ref: int
+      MFT record number, links Journal to MFT
+  - parent_ref: int
+      MFT record number of the parent directory
+  - filename: str
+      Filename at the time of this specific event
+  - reason_flags: List[str]
+      Raw reason flags from journal entry
+
+Fields joined from MFT ($MFT):
+  - extension: str
+      Extracted from filename
+  - full_path: str
+      Reconstructed by walking parent_ref chain in MFT
+  - file_size: int
+  - is_directory: bool
+  - is_deleted_record: bool
+      From MFT record flags (file no longer active)
+  - si_created: datetime
+      $STANDARD_INFORMATION created timestamp (may be manipulated)
+  - fn_created: datetime
+      $FILE_NAME created timestamp (harder to manipulate)
+  - mft_record_number: int
+  - sequence_number: int
+      MFT record reuse counter
+
+Computed fields (calculated during join):
+  - event_type: EventType
+      Normalized from reason_flags
+  - timestamp_delta_seconds: float
+      abs(si_created - fn_created), used for timestomp detection
+
+--------------------------------------------------------------------------------
+3.3 SequenceFinding (Detection Result Object)
+--------------------------------------------------------------------------------
+
+Each pattern detector produces SequenceFinding objects. These are the output
+of the detection engine.
+
+  - pattern: str
+      Name of the matched pattern (e.g., DROPPER_CLEANUP)
+  - file_ref: int or None
+      Primary file reference (None for multi-file patterns)
+  - filename: str
+      Name of the primary file involved
+  - path: str
+      Full path of the primary file
+  - start_time: datetime
+      Timestamp of first event in the sequence
+  - end_time: datetime
+      Timestamp of last event in the sequence
+  - duration_seconds: float
+      Total duration of the sequence
+  - composite_score: float
+      Suspicion score from 0.0 to 1.0
+  - events: List[NormalizedEvent]
+      The specific events that triggered this finding
+  - evidence: List[str]
+      Human-readable explanation of why this was flagged
+
+--------------------------------------------------------------------------------
+3.4 AttackChain (Linked Findings)
+--------------------------------------------------------------------------------
+
+After individual detection, findings that are temporally and spatially related
+are linked into AttackChain objects representing a complete attack sequence.
+
+  - chain_length: int
+      Number of linked SequenceFindings
+  - patterns: List[str]
+      Ordered list of pattern names in the chain
+  - chain_score: float
+      Elevated composite score for the full linked chain
+  - start_time: datetime
+      Timestamp of earliest event in the chain
+  - end_time: datetime
+      Timestamp of latest event in the chain
+  - total_duration_seconds: float
+  - findings: List[SequenceFinding]
+      The individual findings that make up this chain
+  - narrative: str
+      Auto-generated human-readable interpretation of the chain
+
+
+================================================================================
+4. PRE-PROCESSING: BUILDING THE EVENT STREAM
+================================================================================
+
+--------------------------------------------------------------------------------
+4.1 Step-by-Step Build Process
+--------------------------------------------------------------------------------
+
+Execute the following steps in order before running any detectors:
+
+1.  Parse $MFT into a dictionary keyed by mft_record_number:
+    Dict[int, MFTRecord]
+
+2.  Parse $UsnJrnl:$J into a flat list of raw journal entries:
+    List[JournalEntry]
+
+3.  Sort journal entries by USN ascending — this is the canonical event order
+
+4.  For each journal entry, look up the corresponding MFT record by file_ref
+
+5.  Construct a NormalizedEvent by merging journal entry fields with MFT fields
+
+6.  Compute event_type by normalizing reason_flags into the EventType enum
+
+7.  Compute timestamp_delta_seconds = abs(si_created - fn_created)
+
+8.  Collect all NormalizedEvents into the event_stream: List[NormalizedEvent]
+
+9.  Build events_by_ref index: Dict[file_ref, List[NormalizedEvent]]
+
+10. Build events_by_parent index: Dict[parent_ref, List[NormalizedEvent]]
+
+NOTE: Handle missing MFT records gracefully. A journal entry may reference a
+file_ref whose MFT slot has since been reused or overwritten. In this case,
+retain the journal data but mark the joined MFT fields as None. Do not discard
+these events.
+
+NOTE: Journal wrap-around: Check for USN sequence gaps in the journal. A large
+gap in USN values indicates that journal entries were overwritten due to the
+journal reaching its maximum size. Alert the analyst when this occurs, as it
+means part of the filesystem history is missing.
+
+--------------------------------------------------------------------------------
+4.2 Suspicious Path Definition
+--------------------------------------------------------------------------------
+
+A path is classified as suspicious if it matches any of the following patterns
+(case-insensitive regular expression matching):
+
+  - \\Temp\\                         any Temp directory
+  - \\AppData\\Roaming\\             user roaming profile
+  - \\AppData\\Local\\Temp\\         user local temp
+  - \\ProgramData\\                  shared application data
+  - \\Users\\Public\\                publicly accessible user directory
+  - \\Downloads\\                    browser download directory
+  - C:\\[^\\]+\.(exe|dll|ps1)       executable placed at root of C drive
+
+--------------------------------------------------------------------------------
+4.3 Suspicious Extension Definition
+--------------------------------------------------------------------------------
+
+The following file extensions trigger elevated scrutiny in all detectors:
+
+  .exe   Windows executable
+  .dll   Dynamic link library
+  .ps1   PowerShell script
+  .bat   Batch script
+  .vbs   VBScript
+  .js    JavaScript (JScript)
+  .sys   Kernel driver
+  .scr   Screen saver (executable format)
+  .com   DOS executable
+  .hta   HTML Application (executable)
+  .msi   Windows Installer package
+
+--------------------------------------------------------------------------------
+4.4 Timestomp Detection Function
+--------------------------------------------------------------------------------
+
+This function is called by all pattern detectors. A file is considered
+timestamp-suspicious if EITHER condition is true:
+
+  Condition 1 — SI vs FN delta:
+    abs(si_created - fn_created) > 2.0 seconds
+    The $STANDARD_INFORMATION and $FILE_NAME creation timestamps differ by
+    more than 2 seconds. Attackers modify $STANDARD_INFO but often leave
+    $FILE_NAME intact.
+
+  Condition 2 — Zero microseconds:
+    si_created.microsecond == 0
+    The $STANDARD_INFO creation timestamp has zero sub-second precision.
+    Legitimate Windows timestamps always have non-zero microsecond components.
+    A zero value indicates the timestamp was set manually.
+
+NOTE: Timestomp detection alone is not a finding. It is a modifier that
+elevates the score of any finding where it is detected. Always combine with
+other signals.
+
+
+================================================================================
+5. PATTERN DETECTORS
+================================================================================
+
+There are 7 pattern detectors. Each operates independently on the event_stream,
+events_by_ref, or events_by_parent index. All detectors run after the event
+stream is fully built.
+
+--------------------------------------------------------------------------------
+5.1 Pattern: DROPPER_CLEANUP
+--------------------------------------------------------------------------------
+
+Description:
+  A file with a suspicious extension is created in a suspicious path,
+  optionally written to, and then deleted — all within a short time window.
+  This models the dropper-executes-then-self-deletes behavior where malware
+  deploys a payload and removes itself to reduce its on-disk footprint.
+
+Input: events_by_ref index
+
+Detection logic (ALL conditions must be met):
+  - The file_ref has both a CREATE event and a DELETE event in its journal
+    history
+  - The file extension is in the suspicious extensions list
+  - The file path matches the suspicious path list
+  - The duration from the CREATE timestamp to the DELETE timestamp is between
+    0 and 300 seconds
+
+Key fields to extract for the finding:
+  - create_event: the first CREATE event for this file_ref
+  - delete_event: the last DELETE event for this file_ref
+  - duration: (delete_event.timestamp - create_event.timestamp).total_seconds()
+  - has_write: boolean — whether a WRITE event exists between CREATE and DELETE
+
+Base score: 0.75
+
+Scoring modifiers:
+  +0.15  duration < 30 seconds (very fast cleanup — high confidence malicious)
+  +0.08  duration < 120 seconds (fast cleanup)
+  +0.05  a WRITE event is present between CREATE and DELETE
+  +0.15  timestomp detected on the created file
+  +0.10  is_deleted_record is True in MFT (no MFT record remains)
+  +0.10  extension is a script type: .ps1, .vbs, .js, .bat
+
+--------------------------------------------------------------------------------
+5.2 Pattern: MASQUERADE_RENAME
+--------------------------------------------------------------------------------
+
+Description:
+  A file is created with a random or temp-like name and then renamed to
+  impersonate a legitimate Windows system binary. This is used to evade
+  detection tools that look for known-bad filenames, and to blend the
+  malicious file into expected process lists.
+
+Input: events_by_ref index
+
+Detection logic (ALL conditions must be met):
+  - The file_ref has both a RENAME_OLD_NAME event and a RENAME_NEW_NAME event
+    in its journal history
+  - The new filename matches the system binary pattern (case-insensitive):
+    svchost, explorer, lsass, csrss, winlogon, services, spoolsv, taskhost,
+    dllhost, conhost
+  - The old filename matches a random or temp pattern: starts with 6+ hex
+    characters, OR starts with "tmp" or "temp" followed by digits
+
+Implementation note:
+  In the journal, RENAME_OLD_NAME and RENAME_NEW_NAME appear as separate
+  sequential events on the same file_ref. Process them as a pair: find the
+  RENAME_OLD_NAME event, then look for the immediately following
+  RENAME_NEW_NAME event on the same file_ref.
+
+Base score: 0.90 (highest priority pattern)
+
+Scoring modifiers:
+  +0.15  timestomp detected
+  +0.10  rename occurred in a suspicious path
+
+--------------------------------------------------------------------------------
+5.3 Pattern: STAGED_DROPPER
+--------------------------------------------------------------------------------
+
+Description:
+  A burst of 3 or more files is created in the same directory within a short
+  time window, including executables or scripts alongside archives or
+  documents. This models a payload being unpacked or a toolkit being deployed
+  from a carrier file.
+
+Input: events_by_parent index
+
+Detection logic (ALL conditions must be met):
+  - 3 or more FILE_CREATE events share the same parent_ref within a 120-second
+    window
+  - The extensions in the burst include at least one from the suspicious
+    extensions list OR at least one archive extension: .zip, .rar, .7z, .cab
+  - The directory path is in the suspicious path list
+
+Algorithm — sliding window:
+  For each parent directory, sort its CREATE events by USN. Use a sliding
+  window: for each anchor event, collect all subsequent events in the same
+  parent within 120 seconds. If 3 or more are found, evaluate the extension
+  criteria. Break after finding the first qualifying window per parent to avoid
+  duplicate overlapping findings.
+
+Base score: 0.70
+
+Scoring modifiers:
+  +0.15  burst contains more than 10 files
+  +0.08  burst contains more than 5 files
+  +0.10  burst contains BOTH an archive extension AND a suspicious executable
+         extension (strongest signal)
+  +0.15  timestomp detected on any file in the burst
+
+--------------------------------------------------------------------------------
+5.4 Pattern: OVERWRITE_THEN_DELETE
+--------------------------------------------------------------------------------
+
+Description:
+  A file is overwritten (DATA_OVERWRITE journal event) and then deleted within
+  30 seconds. This is potential anti-forensic behavior where the attacker
+  attempts to destroy file content before removing the entry, making recovery
+  harder.
+
+Input: events_by_ref index
+
+Detection logic (ALL conditions must be met):
+  - The file_ref has an OVERWRITE event followed by a DELETE event in its
+    journal history (in USN order)
+  - The time between the OVERWRITE and DELETE events is 30 seconds or less
+
+Base score: 0.80
+
+Scoring modifiers:
+  +0.15  timestomp detected
+  +0.10  file extension is in the suspicious extensions list
+
+--------------------------------------------------------------------------------
+5.5 Pattern: RAPID_MASS_DELETION
+--------------------------------------------------------------------------------
+
+Description:
+  20 or more files are deleted within a 60-second window. This is a
+  near-universal signal for ransomware (which encrypts files and then deletes
+  originals) or an attacker performing aggressive post-compromise cleanup of
+  evidence.
+
+Input: full event_stream (all events, not indexed by ref)
+
+Detection logic:
+  - Extract all events where event_type is DELETE, sorted by USN
+  - Apply a sliding window: for each anchor DELETE event, count how many
+    subsequent DELETE events occur within 60 seconds
+  - If the count is 20 or more, record a finding
+  - Advance the window start pointer past the matched window to avoid duplicate
+    overlapping findings
+
+Base score: 0.85
+
+Scoring modifiers:
+  +0.15  more than 100 files deleted in the window
+  +0.08  more than 50 files deleted in the window
+
+--------------------------------------------------------------------------------
+5.6 Pattern: EXECUTABLE_IN_SUSPICIOUS_PATH
+--------------------------------------------------------------------------------
+
+Description:
+  An executable or script file is created directly in a user-writable or
+  temporary directory. Legitimate software installers operate in Program Files
+  or system directories. Malware frequently deploys to temp directories, user
+  profile directories, or ProgramData to avoid requiring elevated privileges.
+
+Input: full event_stream
+
+Detection logic (ALL conditions must be met):
+  - Event type is CREATE
+  - File extension is in the suspicious extensions list
+  - File path matches the suspicious path list
+
+Base score: 0.60
+
+Scoring modifiers:
+  +0.15  timestomp detected
+  +0.10  is_deleted_record is True (file was later deleted)
+  +0.10  extension is a script type: .ps1, .vbs, .js, .bat
+
+--------------------------------------------------------------------------------
+5.7 Pattern: TIMESTOMP_WITH_WRITE
+--------------------------------------------------------------------------------
+
+Description:
+  A file is written and then its metadata (timestamps) are changed within 5
+  seconds. This sequence indicates deliberate timestamp manipulation immediately
+  following file placement — the attacker is attempting to backdate the file to
+  avoid correlation with the intrusion timeline.
+
+Input: events_by_ref index
+
+Detection logic (ALL conditions must be met):
+  - The file_ref has a WRITE event followed by a METADATA event within 5
+    seconds (in USN order)
+  - The timestomp detection function returns True for this file (SI vs FN
+    delta > 2s, or zero microseconds)
+
+Base score: 0.85
+
+Scoring modifiers:
+  +0.15  timestamp_delta_seconds > 86400 (more than 1 day of backdating —
+         severe manipulation)
+  +0.08  timestamp_delta_seconds > 3600 (more than 1 hour of backdating)
+
+
+================================================================================
+6. COMPOSITE SCORING MODEL
+================================================================================
+
+--------------------------------------------------------------------------------
+6.1 Score Formula
+--------------------------------------------------------------------------------
+
+  composite_score = min(base_score + sum(applicable_modifiers), 1.0)
+
+Scores are capped at 1.0. Never exceed 1.0 regardless of modifiers.
+
+--------------------------------------------------------------------------------
+6.2 Universal Modifiers
+--------------------------------------------------------------------------------
+
+These modifiers apply to ANY pattern in addition to pattern-specific modifiers:
+
+  +0.15  timestomp detected on any involved file (SI vs FN delta > 2s, or
+         zero microseconds)
+  +0.10  is_deleted_record is True in MFT (no active MFT record remains)
+  +0.10  extension is a script type (.ps1, .vbs, .js, .bat) rather than a
+         compiled executable
+
+--------------------------------------------------------------------------------
+6.3 Severity Thresholds
+--------------------------------------------------------------------------------
+
+  0.80 - 1.0   CRITICAL  Investigate immediately. High confidence malicious.
+  0.60 - 0.79  HIGH      Strong indicators. Analyst review required.
+  0.40 - 0.59  MEDIUM    Suspicious but could be legitimate. Context needed.
+  0.00 - 0.39  LOW       Weak signal. Flag for awareness only.
+
+--------------------------------------------------------------------------------
+6.4 Base Scores by Pattern
+--------------------------------------------------------------------------------
+
+  DROPPER_CLEANUP                0.75
+  MASQUERADE_RENAME              0.90
+  STAGED_DROPPER                 0.70
+  OVERWRITE_THEN_DELETE          0.80
+  RAPID_MASS_DELETION            0.85
+  EXECUTABLE_IN_SUSPICIOUS_PATH  0.60
+  TIMESTOMP_WITH_WRITE           0.85
+
+
+================================================================================
+7. ATTACK CHAIN LINKING
+================================================================================
+
+--------------------------------------------------------------------------------
+7.1 Purpose
+--------------------------------------------------------------------------------
+
+Individual pattern findings are valuable, but the real forensic power comes
+from linking multiple findings into a chain. A chain represents a complete
+attack sequence — for example, a file dropped in a temp directory, renamed to
+impersonate a system binary, and then deleted after execution. The chain
+provides the narrative that demonstrates root cause.
+
+--------------------------------------------------------------------------------
+7.2 Linking Criteria
+--------------------------------------------------------------------------------
+
+Two findings (A and B, where A ends before B starts) are linked into the same
+chain if they meet ALL of the following criteria:
+
+  - Temporal proximity: The time gap between end_time of finding A and
+    start_time of finding B is 300 seconds or less (configurable)
+
+  - Spatial relationship: They share the same parent directory path (match the
+    directory portion of the path), OR they share one or more file_ref values
+    across their event lists
+
+NOTE: Sort all findings by start_time before running the chain linker. Process
+findings in chronological order. Use a greedy approach: once a finding is
+assigned to a chain, do not reassign it.
+
+--------------------------------------------------------------------------------
+7.3 Chain Score Calculation
+--------------------------------------------------------------------------------
+
+  chain_score = min((average of all finding scores in chain) * 1.3, 1.0)
+
+The 1.3 multiplier elevates chain scores above their individual component
+scores. Chains are the primary output presented to the analyst — individual
+findings are secondary detail.
+
+--------------------------------------------------------------------------------
+7.4 Narrative Generation
+--------------------------------------------------------------------------------
+
+Generate a human-readable narrative for each chain using the following
+interpretation rules. Check patterns in the chain against these conditions:
+
+  STAGED_DROPPER + DROPPER_CLEANUP
+    -> "malware deployment with post-execution self-deletion"
+
+  MASQUERADE_RENAME + EXECUTABLE_IN_SUSPICIOUS_PATH
+    -> "binary masquerading to impersonate a legitimate Windows process"
+
+  TIMESTOMP_WITH_WRITE + DROPPER_CLEANUP
+    -> "anti-forensic malware attempting to conceal its presence and timing"
+
+  OVERWRITE_THEN_DELETE present
+    -> "possible secure wipe — attacker attempting to destroy evidence before
+        deletion"
+
+  RAPID_MASS_DELETION present
+    -> "possible ransomware encryption-then-deletion cycle or aggressive
+        attacker cleanup"
+
+  Default (no specific match)
+    -> "coordinated suspicious filesystem activity requiring analyst review"
+
+Narrative format template:
+  "Starting at [start_time], a sequence of [N] suspicious activities was
+  detected over [total_duration_seconds] seconds:
+  [PATTERN_A -> PATTERN_B -> PATTERN_C].
+  This chain suggests: [interpretation]."
+
+
+================================================================================
+8. FULL PROCESSING PIPELINE
+================================================================================
+
+--------------------------------------------------------------------------------
+8.1 Execution Order
+--------------------------------------------------------------------------------
+
+Run the complete pipeline in this exact order:
+
+1.  Parse $MFT -> Dict[record_number, MFTRecord]
+
+2.  Parse $UsnJrnl:$J -> List[JournalEntry], sorted by USN ascending
+
+3.  Join Journal entries with MFT records by file_ref
+    -> List[NormalizedEvent]
+
+4.  Build events_by_ref index:
+    Dict[file_ref, List[NormalizedEvent]]
+
+5.  Build events_by_parent index:
+    Dict[parent_ref, List[NormalizedEvent]]
+
+6.  Run all 7 pattern detectors in parallel (they are independent)
+
+7.  Calculate composite_score for each SequenceFinding
+
+8.  Sort all findings by start_time ascending
+
+9.  Run chain linker to group findings into AttackChains
+
+10. Calculate chain_score for each AttackChain
+
+11. Generate narrative string for each AttackChain
+
+12. Return AttackChains sorted by chain_score descending
+    (highest score = most suspicious = analyst starts here)
+
+--------------------------------------------------------------------------------
+8.2 Output Contract
+--------------------------------------------------------------------------------
+
+The pipeline must return two outputs:
+
+  PRIMARY:
+    List[AttackChain] sorted by chain_score descending
+    The analyst starts at the top of this list.
+
+  SECONDARY:
+    List[SequenceFinding] for all unlinked single findings sorted by
+    composite_score descending (findings that did not form part of a chain)
+
+NOTE: The analyst should always start with the highest-scoring attack chain and
+work backward through its constituent events to identify the initial access
+point. The chain narrative provides the starting hypothesis; the individual
+events in the chain findings provide the supporting evidence.
+
+--------------------------------------------------------------------------------
+8.3 Performance Requirements
+--------------------------------------------------------------------------------
+
+- Use USN as primary sort key everywhere — never rely on timestamp ordering
+  alone
+
+- Build the events_by_ref and events_by_parent indexes BEFORE running
+  detectors — O(1) lookup is required for performance at scale (MFT files from
+  large drives can be 500MB+)
+
+- Sliding window algorithms must advance the start pointer when the window
+  closes to avoid O(n^2) complexity on large journals
+
+- MFT record numbers are reused over time — always use the
+  (record_number, sequence_number) pair to uniquely identify a file at a
+  specific point in time
+
+- Process the journal as a stream — do not load the entire journal into memory
+  at once
+
+
+================================================================================
+9. QUICK REFERENCE: PATTERN SUMMARY
+================================================================================
+
+Pattern                       | Base  | Input           | Key Condition
+------------------------------|-------|-----------------|----------------------------------
+DROPPER_CLEANUP               | 0.75  | events_by_ref   | CREATE + DELETE on same file_ref
+                              |       |                 | within 300s, suspicious ext+path
+MASQUERADE_RENAME             | 0.90  | events_by_ref   | RENAME to system binary name
+                              |       |                 | from random/temp source name
+STAGED_DROPPER                | 0.70  | events_by_parent| 3+ CREATEs in same dir within
+                              |       |                 | 120s with suspicious extensions
+OVERWRITE_THEN_DELETE         | 0.80  | events_by_ref   | OVERWRITE then DELETE within 30s
+RAPID_MASS_DELETION           | 0.85  | event_stream    | 20+ DELETEs within 60s
+EXECUTABLE_IN_SUSPICIOUS_PATH | 0.60  | event_stream    | Single CREATE with suspicious
+                              |       |                 | ext in suspicious path
+TIMESTOMP_WITH_WRITE          | 0.85  | events_by_ref   | WRITE then METADATA within 5s
+                              |       |                 | AND timestomp function = True
+
+
+================================================================================
+END OF SPECIFICATION
+================================================================================
