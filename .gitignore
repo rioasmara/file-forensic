@@ -56,3 +56,6 @@ dist/
 .coverage
 htmlcov/
 .tox/
+
+# Troubleshooting / diagnostic scripts (not part of app)
+diagnose_mft.py
